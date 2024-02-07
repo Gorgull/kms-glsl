@@ -23,7 +23,6 @@
  */
 
 #include <assert.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -125,6 +124,9 @@ const struct gbm * init_gbm(int drm_fd, int w, int h, uint32_t format,
 		uint64_t modifier, bool surfaceless)
 {
 	gbm.dev = gbm_create_device(drm_fd);
+	if (!gbm.dev)
+		return NULL;
+
 	gbm.format = format;
 	gbm.surface = NULL;
 
@@ -367,8 +369,6 @@ const struct egl * init_egl(const struct gbm *gbm)
 	printf("EGL information:\n");
 	printf("  version: \"%s\"\n", eglQueryString(egl.display, EGL_VERSION));
 	printf("  vendor: \"%s\"\n", eglQueryString(egl.display, EGL_VENDOR));
-	printf("  client extensions: \"%s\"\n", egl_exts_client);
-	printf("  display extensions: \"%s\"\n", egl_exts_dpy);
 	printf("===================================\n");
 
 	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
@@ -384,7 +384,7 @@ const struct egl * init_egl(const struct gbm *gbm)
 
 	egl.context = eglCreateContext(egl.display, egl.config,
 			EGL_NO_CONTEXT, context_attribs);
-	if (egl.context == NULL) {
+	if (egl.context == EGL_NO_CONTEXT) {
 		printf("failed to create context\n");
 		return NULL;
 	}
@@ -409,7 +409,6 @@ const struct egl * init_egl(const struct gbm *gbm)
 	printf("  shading language version: \"%s\"\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
 	printf("  vendor: \"%s\"\n", glGetString(GL_VENDOR));
 	printf("  renderer: \"%s\"\n", glGetString(GL_RENDERER));
-	printf("  extensions: \"%s\"\n", gl_exts);
 	printf("===================================\n");
 
 	get_proc_gl(GL_OES_EGL_image, glEGLImageTargetTexture2DOES);
@@ -444,6 +443,10 @@ int create_program(const char *vs_src, const char *fs_src)
 	GLint ret;
 
 	vertex_shader = glCreateShader(GL_VERTEX_SHADER);
+	if (vertex_shader == 0) {
+		printf("vertex shader creation failed!\n");
+		return -1;
+	}
 
 	glShaderSource(vertex_shader, 1, &vs_src, NULL);
 	glCompileShader(vertex_shader);
@@ -465,6 +468,10 @@ int create_program(const char *vs_src, const char *fs_src)
 	}
 
 	fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
+	if (fragment_shader == 0) {
+		printf("fragment shader creation failed!\n");
+		return -1;
+	}
 
 	glShaderSource(fragment_shader, 1, &fs_src, NULL);
 	glCompileShader(fragment_shader);

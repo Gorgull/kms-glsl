@@ -75,9 +75,17 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 		return ret;
 	}
 
+	uint32_t flags;
+
+	if (drm.async_page_flip) {
+		flags = DRM_MODE_PAGE_FLIP_ASYNC;
+	} else {
+		flags = DRM_MODE_PAGE_FLIP_EVENT;
+	}
+
 	start_time = report_time = get_time_ns();
 
-	while (i < drm.count) {
+	while (drm.count == 0 || i < drm.count) {
 		unsigned frame = i;
 		struct gbm_bo *next_bo;
 		int waiting_for_flip = 1;
@@ -95,11 +103,17 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 
 		egl->draw(start_time, i++);
 
+		/* Block until all the buffered GL operations are completed.
+		 * This is required on NVIDIA GPUs, for which the DRM drivers
+		 * do not wait for the rendering to complete, upon executing
+		 * page flipping operations, such as drmModePageFlip().
+		 */
+		glFinish();
+
 		if (gbm->surface) {
 			eglSwapBuffers(egl->display, egl->surface);
 			next_bo = gbm_surface_lock_front_buffer(gbm->surface);
 		} else {
-			glFinish();
 			next_bo = gbm->bos[frame % NUM_BUFFERS];
 		}
 		fb = drm_fb_get_from_bo(next_bo);
@@ -114,29 +128,31 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 		 */
 
 		ret = drmModePageFlip(drm.fd, drm.crtc_id, fb->fb_id,
-				DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
+				flags, &waiting_for_flip);
 		if (ret) {
 			printf("failed to queue page flip: %s\n", strerror(errno));
 			return -1;
 		}
 
-		while (waiting_for_flip) {
-			FD_ZERO(&fds);
-			FD_SET(0, &fds);
-			FD_SET(drm.fd, &fds);
+		if (!drm.async_page_flip) {
+			while (waiting_for_flip) {
+				FD_ZERO(&fds);
+				FD_SET(0, &fds);
+				FD_SET(drm.fd, &fds);
 
-			ret = select(drm.fd + 1, &fds, NULL, NULL, NULL);
-			if (ret < 0) {
-				printf("select err: %s\n", strerror(errno));
-				return ret;
-			} else if (ret == 0) {
-				printf("select timeout!\n");
-				return -1;
-			} else if (FD_ISSET(0, &fds)) {
-				printf("user interrupted!\n");
-				return 0;
+				ret = select(drm.fd + 1, &fds, NULL, NULL, NULL);
+				if (ret < 0) {
+					printf("select err: %s\n", strerror(errno));
+					return ret;
+				} else if (ret == 0) {
+					printf("select timeout!\n");
+					return -1;
+				} else if (FD_ISSET(0, &fds)) {
+					printf("user interrupted!\n");
+					return 0;
+				}
+				drmHandleEvent(drm.fd, &evctx);
 			}
-			drmHandleEvent(drm.fd, &evctx);
 		}
 
 		cur_time = get_time_ns();
@@ -170,16 +186,16 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 	return 0;
 }
 
-const struct drm * init_drm_legacy(const char *device, const char *mode_str,
-		unsigned int vrefresh, unsigned int count)
+const struct drm * init_drm_legacy(int fd, const struct options *options)
 {
 	int ret;
 
-	ret = init_drm(&drm, device, mode_str, vrefresh, count);
+	ret = init_drm(&drm, fd, options);
 	if (ret)
 		return NULL;
 
 	drm.run = legacy_run;
+	drm.async_page_flip = options->async_page_flip;
 
 	return &drm;
 }

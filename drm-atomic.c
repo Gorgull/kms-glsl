@@ -22,7 +22,6 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#include <assert.h>
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>
@@ -33,11 +32,7 @@
 #include "common.h"
 #include "drm-common.h"
 
-#define VOID2U64(x) ((uint64_t)(unsigned long)(x))
-
-static struct drm drm = {
-	.kms_out_fence_fd = -1,
-};
+static struct drm drm;
 
 static int add_connector_property(drmModeAtomicReq *req, uint32_t obj_id,
 					const char *name, uint64_t value)
@@ -97,7 +92,6 @@ static int add_plane_property(drmModeAtomicReq *req, uint32_t obj_id,
 		}
 	}
 
-
 	if (prop_id < 0) {
 		printf("no plane property: %s\n", name);
 		return -EINVAL;
@@ -142,37 +136,21 @@ static int drm_atomic_commit(uint32_t fb_id, uint32_t flags)
 	add_plane_property(req, plane_id, "CRTC_W", drm.mode->hdisplay);
 	add_plane_property(req, plane_id, "CRTC_H", drm.mode->vdisplay);
 
-	if (drm.kms_in_fence_fd != -1) {
-		add_crtc_property(req, drm.crtc_id, "OUT_FENCE_PTR",
-				VOID2U64(&drm.kms_out_fence_fd));
-		add_plane_property(req, plane_id, "IN_FENCE_FD", drm.kms_in_fence_fd);
-	}
-
 	ret = drmModeAtomicCommit(drm.fd, req, flags, NULL);
-	if (ret)
-		goto out;
 
-	if (drm.kms_in_fence_fd != -1) {
-		close(drm.kms_in_fence_fd);
-		drm.kms_in_fence_fd = -1;
-	}
-
-out:
 	drmModeAtomicFree(req);
 
 	return ret;
 }
 
-static EGLSyncKHR create_fence(const struct egl *egl, int fd)
-{
-	EGLint attrib_list[] = {
-		EGL_SYNC_NATIVE_FENCE_FD_ANDROID, fd,
-		EGL_NONE,
-	};
-	EGLSyncKHR fence = egl->eglCreateSyncKHR(egl->display,
-			EGL_SYNC_NATIVE_FENCE_ANDROID, attrib_list);
-	assert(fence);
-	return fence;
+static void on_pageflip_event(
+		int fd,
+		unsigned int frame,
+		unsigned int sec,
+		unsigned int usec,
+		void *userdata
+) {
+//	printf("page flip event occurred: %12.6f\n", sec + (usec / 1000000.0));
 }
 
 static int atomic_run(const struct gbm *gbm, const struct egl *egl)
@@ -180,42 +158,29 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 	struct gbm_bo *bo = NULL;
 	struct drm_fb *fb;
 	uint32_t i = 0;
-	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
 	uint64_t start_time, report_time, cur_time;
 	int ret;
 
-	if (egl_check(egl, eglDupNativeFenceFDANDROID) ||
-		egl_check(egl, eglCreateSyncKHR) ||
-		egl_check(egl, eglDestroySyncKHR) ||
-		egl_check(egl, eglWaitSyncKHR) ||
-		egl_check(egl, eglClientWaitSyncKHR))
-		return -1;
+	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
+	if (drm.async_page_flip) {
+		flags |= DRM_MODE_PAGE_FLIP_ASYNC;
+	} else {
+		flags |= DRM_MODE_PAGE_FLIP_EVENT;
+	}
+
+	drmEventContext evctx = {
+			.version = 4,
+			.page_flip_handler = on_pageflip_event
+	};
 
 	/* Allow a modeset change for the first commit only. */
 	flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
 
 	start_time = report_time = get_time_ns();
 
-	while (i < drm.count) {
+	while (drm.count == 0 || i < drm.count) {
 		unsigned frame = i;
 		struct gbm_bo *next_bo;
-		EGLSyncKHR gpu_fence = NULL;   /* out-fence from gpu, in-fence to kms */
-		EGLSyncKHR kms_fence = NULL;   /* in-fence to gpu, out-fence from kms */
-
-		if (drm.kms_out_fence_fd != -1) {
-			kms_fence = create_fence(egl, drm.kms_out_fence_fd);
-			assert(kms_fence);
-
-			/* driver now has ownership of the fence fd: */
-			drm.kms_out_fence_fd = -1;
-
-			/* wait "on the gpu" (ie. this won't necessarily block, but
-			 * will block the rendering until fence is signaled), until
-			 * the previous pageflip completes so we don't render into
-			 * the buffer that is still on screen.
-			 */
-			egl->eglWaitSyncKHR(egl->display, kms_fence, 0);
-		}
 
 		/* Start fps measuring on second frame, to remove the time spent
 		 * compiling shader, etc, from the fps:
@@ -230,22 +195,16 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 
 		egl->draw(start_time, i++);
 
-		/* insert fence to be singled in cmdstream.. this fence will be
-		 * signaled when gpu rendering done
+		/* Block until all the buffered GL operations are completed.
+		 * This is required on NVIDIA GPUs, for which the DRM drivers
+		 * do not wait for the rendering to complete, upon executing
+		 * page flipping operations.
 		 */
-		gpu_fence = create_fence(egl, EGL_NO_NATIVE_FENCE_FD_ANDROID);
-		assert(gpu_fence);
+		glFinish();
 
 		if (gbm->surface) {
 			eglSwapBuffers(egl->display, egl->surface);
 		}
-
-		/* after swapbuffers, gpu_fence should be flushed, so safe
-		 * to get fd:
-		 */
-		drm.kms_in_fence_fd = egl->eglDupNativeFenceFDANDROID(egl->display, gpu_fence);
-		egl->eglDestroySyncKHR(egl->display, gpu_fence);
-		assert(drm.kms_in_fence_fd != -1);
 
 		if (gbm->surface) {
 			next_bo = gbm_surface_lock_front_buffer(gbm->surface);
@@ -260,24 +219,6 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 		if (!fb) {
 			printf("Failed to get a new framebuffer BO\n");
 			return -1;
-		}
-
-		if (kms_fence) {
-			EGLint status;
-
-			/* Wait on the CPU side for the _previous_ commit to
-			 * complete before we post the flip through KMS, as
-			 * atomic will reject the commit if we post a new one
-			 * whilst the previous one is still pending.
-			 */
-			do {
-				status = egl->eglClientWaitSyncKHR(egl->display,
-								   kms_fence,
-								   0,
-								   EGL_FOREVER_KHR);
-			} while (status != EGL_CONDITION_SATISFIED_KHR);
-
-			egl->eglDestroySyncKHR(egl->display, kms_fence);
 		}
 
 		cur_time = get_time_ns();
@@ -311,6 +252,14 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 			return -1;
 		}
 
+		if (!drm.async_page_flip) {
+			ret = drmHandleEvent(drm.fd, &evctx);
+			if (ret) {
+				printf("failed to wait for page flip completion\n");
+				return -1;
+			}
+		}
+
 		/* release last buffer to render on again: */
 		if (bo && gbm->surface)
 			gbm_surface_release_buffer(gbm->surface, bo);
@@ -334,11 +283,11 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 	return ret;
 }
 
-/* Pick a plane.. something that at a minimum can be connected to
+/* Pick a plane, something that at a minimum can be connected to
  * the chosen crtc, but prefer primary plane.
  *
  * Seems like there is some room for a drmModeObjectGetNamedProperty()
- * type helper in libdrm..
+ * type helper in libdrm.
  */
 static int get_plane_id(void)
 {
@@ -392,13 +341,12 @@ static int get_plane_id(void)
 	return ret;
 }
 
-const struct drm * init_drm_atomic(const char *device, const char *mode_str,
-		unsigned int vrefresh, unsigned int count)
+const struct drm * init_drm_atomic(int fd, const struct options *options)
 {
-	uint32_t plane_id;
 	int ret;
+	uint32_t plane_id;
 
-	ret = init_drm(&drm, device, mode_str, vrefresh, count);
+	ret = init_drm(&drm, fd, options);
 	if (ret)
 		return NULL;
 
@@ -459,6 +407,7 @@ const struct drm * init_drm_atomic(const char *device, const char *mode_str,
 	get_properties(connector, CONNECTOR, drm.connector_id);
 
 	drm.run = atomic_run;
+	drm.async_page_flip = options->async_page_flip;
 
 	return &drm;
 }

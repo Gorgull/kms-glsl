@@ -22,7 +22,6 @@
  */
 
 #include <errno.h>
-#include <inttypes.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,9 +91,8 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 			modifiers[i] = modifiers[0];
 		}
 
-		if (modifiers[0]) {
+		if (modifiers[0] && modifiers[0] != DRM_FORMAT_MOD_INVALID) {
 			flags = DRM_MODE_FB_MODIFIERS;
-			printf("Using modifier %" PRIx64 "\n", modifiers[0]);
 		}
 
 		ret = drmModeAddFB2WithModifiers(drm_fd, width, height,
@@ -124,7 +122,7 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 	return fb;
 }
 
-static uint32_t find_crtc_for_encoder(const drmModeRes *resources,
+static int32_t find_crtc_for_encoder(const drmModeRes *resources,
 		const drmModeEncoder *encoder) {
 	int i;
 
@@ -143,7 +141,7 @@ static uint32_t find_crtc_for_encoder(const drmModeRes *resources,
 	return -1;
 }
 
-static uint32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes *resources,
+static int32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes *resources,
 		const drmModeConnector *connector) {
 	int i;
 
@@ -152,7 +150,7 @@ static uint32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes 
 		drmModeEncoder *encoder = drmModeGetEncoder(drm->fd, encoder_id);
 
 		if (encoder) {
-			const uint32_t crtc_id = find_crtc_for_encoder(resources, encoder);
+			const int32_t crtc_id = find_crtc_for_encoder(resources, encoder);
 
 			drmModeFreeEncoder(encoder);
 			if (crtc_id != 0) {
@@ -175,7 +173,7 @@ static int get_resources(int fd, drmModeRes **resources)
 
 #define MAX_DRM_DEVICES 64
 
-static int find_drm_device(drmModeRes **resources)
+int find_drm_device()
 {
 	drmDevicePtr devices[MAX_DRM_DEVICES] = { NULL };
 	int num_devices, fd = -1;
@@ -187,6 +185,7 @@ static int find_drm_device(drmModeRes **resources)
 	}
 
 	for (int i = 0; i < num_devices; i++) {
+		drmModeRes *resources;
 		drmDevicePtr device = devices[i];
 		int ret;
 
@@ -199,7 +198,8 @@ static int find_drm_device(drmModeRes **resources)
 		fd = open(device->nodes[DRM_NODE_PRIMARY], O_RDWR);
 		if (fd < 0)
 			continue;
-		ret = get_resources(fd, resources);
+		ret = get_resources(fd, &resources);
+		drmModeFreeResources(resources);
 		if (!ret)
 			break;
 		close(fd);
@@ -212,28 +212,16 @@ static int find_drm_device(drmModeRes **resources)
 	return fd;
 }
 
-int init_drm(struct drm *drm, const char *device, const char *mode_str,
-		unsigned int vrefresh, unsigned int count)
+int init_drm(struct drm *drm, const int fd, const struct options *options)
 {
 	drmModeRes *resources;
 	drmModeConnector *connector = NULL;
 	drmModeEncoder *encoder = NULL;
-	int i, ret, area;
+	int i, area;
 
-	if (device) {
-		drm->fd = open(device, O_RDWR);
-		ret = get_resources(drm->fd, &resources);
-		if (ret < 0 && errno == EOPNOTSUPP)
-			printf("%s does not look like a modeset device\n", device);
-	} else {
-		drm->fd = find_drm_device(&resources);
-	}
+	drm->fd = fd;
 
-	if (drm->fd < 0) {
-		printf("could not open drm device\n");
-		return -1;
-	}
-
+	get_resources(drm->fd, &resources);
 	if (!resources) {
 		printf("drmModeGetResources failed: %s\n", strerror(errno));
 		return -1;
@@ -252,19 +240,19 @@ int init_drm(struct drm *drm, const char *device, const char *mode_str,
 
 	if (!connector) {
 		/* we could be fancy and listen for hotplug events and wait for
-		 * a connector..
+		 * a connector.
 		 */
 		printf("no connected connector!\n");
 		return -1;
 	}
 
 	/* find user requested mode: */
-	if (mode_str && *mode_str) {
+	if (/*options->mode && */*options->mode) {
 		for (i = 0; i < connector->count_modes; i++) {
 			drmModeModeInfo *current_mode = &connector->modes[i];
 
-			if (strcmp(current_mode->name, mode_str) == 0) {
-				if (vrefresh == 0 || current_mode->vrefresh == vrefresh) {
+			if (strcmp(current_mode->name, options->mode) == 0) {
+				if (options->vrefresh == 0 || current_mode->vrefresh == options->vrefresh) {
 					drm->mode = current_mode;
 					break;
 				}
@@ -309,8 +297,8 @@ int init_drm(struct drm *drm, const char *device, const char *mode_str,
 	if (encoder) {
 		drm->crtc_id = encoder->crtc_id;
 	} else {
-		uint32_t crtc_id = find_crtc_for_connector(drm, resources, connector);
-		if (crtc_id == 0) {
+		int32_t crtc_id = find_crtc_for_connector(drm, resources, connector);
+		if (crtc_id == -1) {
 			printf("no crtc found!\n");
 			return -1;
 		}
@@ -328,7 +316,7 @@ int init_drm(struct drm *drm, const char *device, const char *mode_str,
 	drmModeFreeResources(resources);
 
 	drm->connector_id = connector->connector_id;
-	drm->count = count;
+	drm->count = options->count;
 
 	return 0;
 }
