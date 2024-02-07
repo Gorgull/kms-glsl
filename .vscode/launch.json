@@ -10,7 +10,7 @@
             "name": "Debug",
             "program": "${workspaceFolder}/glsl",
             "cwd": "${workspaceRoot}",
-            "args": ["-v 720x480-60", "examples/breathing_spirals.glsl"],
+            "args": ["-v 1280x720-60", "examples/breathing_spirals.glsl"],
         }
     ]
 }
